@@ -1,12 +1,27 @@
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 /// Logical directory size. Permission errors count as 0.
 pub fn du(path: &Path) -> u64 {
-    du_inner(path, &mut HashSet::new(), 0)
+    du_with(path, &mut |_, _| {})
 }
 
-fn du_inner(path: &Path, seen_dev_ino: &mut HashSet<(u64, u64)>, depth: u32) -> u64 {
+pub fn du_with(path: &Path, tick: &mut impl FnMut(&Path, u64)) -> u64 {
+    let acc = Cell::new(0u64);
+    let last = Cell::new(Instant::now() - Duration::from_secs(1));
+    du_inner(path, &mut HashSet::new(), 0, &acc, &last, tick)
+}
+
+fn du_inner(
+    path: &Path,
+    seen_dev_ino: &mut HashSet<(u64, u64)>,
+    depth: u32,
+    acc: &Cell<u64>,
+    last: &Cell<Instant>,
+    tick: &mut impl FnMut(&Path, u64),
+) -> u64 {
     if depth > 40 {
         return 0;
     }
@@ -25,7 +40,10 @@ fn du_inner(path: &Path, seen_dev_ino: &mut HashSet<(u64, u64)>, depth: u32) -> 
         }
     }
     if meta.is_file() {
-        return meta.len();
+        let n = meta.len();
+        acc.set(acc.get().saturating_add(n));
+        maybe_tick(path, acc, last, tick);
+        return n;
     }
     if !meta.is_dir() {
         return 0;
@@ -36,9 +54,29 @@ fn du_inner(path: &Path, seen_dev_ino: &mut HashSet<(u64, u64)>, depth: u32) -> 
         Err(_) => return 0,
     };
     for ent in rd.flatten() {
-        total = total.saturating_add(du_inner(&ent.path(), seen_dev_ino, depth + 1));
+        total = total.saturating_add(du_inner(
+            &ent.path(),
+            seen_dev_ino,
+            depth + 1,
+            acc,
+            last,
+            tick,
+        ));
     }
+    maybe_tick(path, acc, last, tick);
     total
+}
+
+fn maybe_tick(
+    path: &Path,
+    acc: &Cell<u64>,
+    last: &Cell<Instant>,
+    tick: &mut impl FnMut(&Path, u64),
+) {
+    if last.get().elapsed() >= Duration::from_millis(120) {
+        tick(path, acc.get());
+        last.set(Instant::now());
+    }
 }
 
 pub fn reclaimable(selected: &[PathBuf], all_sizes: &[(PathBuf, u64)]) -> u64 {

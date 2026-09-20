@@ -2,4 +2,4 @@ mod clean;
 mod scan;
 
 pub use clean::dry_run;
-pub use scan::{scan, Inventory};
+pub use scan::{scan, scan_with, Inventory};

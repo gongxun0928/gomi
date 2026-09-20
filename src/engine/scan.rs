@@ -11,6 +11,7 @@ use crate::plugins::agent::{claim_by_path, discover_checkouts};
 use crate::plugins::cache::expand_exact;
 use crate::plugins::language::claim as claim_language;
 use crate::plugins::{agent, caches, CacheClean};
+use crate::progress::{default_progress, ScanProgress};
 use crate::safety::{can_emit_node, can_walk, is_forbidden_scan_root};
 
 const SKIP_DESCEND: &[&str] = &[
@@ -48,6 +49,13 @@ fn find_path<'a>(n: &'a Node, path: &Path) -> Option<&'a Node> {
 }
 
 pub fn scan(cfg: &Config) -> Inventory {
+    let mut progress = default_progress();
+    let inv = scan_with(cfg, progress.as_mut());
+    progress.finish();
+    inv
+}
+
+pub fn scan_with(cfg: &Config, progress: &mut dyn ScanProgress) -> Inventory {
     let mut covered: HashSet<PathBuf> = HashSet::new();
     let mut roots = Vec::new();
 
@@ -56,7 +64,7 @@ pub fn scan(cfg: &Config) -> Inventory {
             if !covered.insert(checkout.clone()) {
                 continue;
             }
-            if let Some(node) = agent_node(&checkout, cfg) {
+            if let Some(node) = agent_node(&checkout, cfg, progress) {
                 roots.push(node);
             }
         }
@@ -66,21 +74,37 @@ pub fn scan(cfg: &Config) -> Inventory {
 
     for proj in &cfg.project_roots {
         if is_forbidden_scan_root(proj) {
-            eprintln!("skip forbidden scan root: {}", proj.display());
             continue;
         }
+        progress.walking(proj, None);
         if cfg.include_hotspots {
-            collect_git_worktrees(proj, &mut covered, &mut roots, cfg);
+            collect_git_worktrees(proj, &mut covered, &mut roots, cfg, progress);
         }
-        let arts = language_under(proj, Some(proj), &agent_paths);
+        let arts = language_under(proj, Some(proj), &agent_paths, progress, true);
         roots.extend(arts);
     }
 
     if cfg.include_hotspots {
-        roots.extend(cache_nodes());
+        roots.extend(cache_nodes(progress));
     }
     roots.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
     Inventory { roots }
+}
+
+fn measure(
+    path: &Path,
+    label: &str,
+    add_to_total: bool,
+    progress: &mut dyn ScanProgress,
+) -> u64 {
+    progress.sizing(path, label, 0, add_to_total);
+    crate::inventory::du_with(path, &mut |_p, running| {
+        progress.sizing(path, label, running, add_to_total);
+    })
+}
+
+fn label(kind: &str, plugin: &str) -> String {
+    format!("{kind}/{plugin}")
 }
 
 fn discover_agent_checkouts(cfg: &Config) -> Vec<PathBuf> {
@@ -105,7 +129,13 @@ fn discover_agent_checkouts(cfg: &Config) -> Vec<PathBuf> {
     out
 }
 
-fn collect_git_worktrees(proj: &Path, covered: &mut HashSet<PathBuf>, roots: &mut Vec<Node>, cfg: &Config) {
+fn collect_git_worktrees(
+    proj: &Path,
+    covered: &mut HashSet<PathBuf>,
+    roots: &mut Vec<Node>,
+    cfg: &Config,
+    progress: &mut dyn ScanProgress,
+) {
     walk_git_repos(proj, &mut HashSet::new(), 0, &mut |repo| {
         for wt in gitx::worktree_list(repo) {
             if wt.is_primary {
@@ -114,7 +144,7 @@ fn collect_git_worktrees(proj: &Path, covered: &mut HashSet<PathBuf>, roots: &mu
             if !covered.insert(wt.path.clone()) {
                 continue;
             }
-            if let Some(node) = agent_node(&wt.path, cfg) {
+            if let Some(node) = agent_node(&wt.path, cfg, progress) {
                 roots.push(node);
             }
         }
@@ -144,7 +174,7 @@ fn walk_git_repos(dir: &Path, seen: &mut HashSet<PathBuf>, depth: u32, on_repo: 
     }
 }
 
-fn agent_node(checkout: &Path, cfg: &Config) -> Option<Node> {
+fn agent_node(checkout: &Path, cfg: &Config, progress: &mut dyn ScanProgress) -> Option<Node> {
     if !can_emit_node(checkout) || !checkout.is_dir() {
         return None;
     }
@@ -153,10 +183,9 @@ fn agent_node(checkout: &Path, cfg: &Config) -> Option<Node> {
     let dirty = gitx::is_dirty(checkout);
     let mtime = gitx::dir_mtime(checkout);
     let stale = is_stale(mtime, cfg.stale_after_days);
-    let children = language_under(checkout, Some(checkout), &[]);
-    eprint!("  size {} ... ", checkout.display());
-    let size = crate::inventory::du(checkout);
-    eprintln!("{}", crate::inventory::human(size));
+    progress.walking(checkout, None);
+    let children = language_under(checkout, Some(checkout), &[], progress, false);
+    let size = measure(checkout, &label("agent", plugin.id()), true, progress);
     let (action, method) = if primary {
         (DefaultAction::None, CleanMethod::None)
     } else if dirty {
@@ -204,6 +233,12 @@ fn agent_node(checkout: &Path, cfg: &Config) -> Option<Node> {
     for c in &mut node.children {
         c.parent_id = Some(id.clone());
     }
+    progress.found(
+        checkout,
+        &label("agent", plugin.id()),
+        size,
+        true,
+    );
     Some(node)
 }
 
@@ -212,17 +247,34 @@ fn under_agent_root(path: &Path) -> bool {
     s.contains("/.cursor/worktrees/") || s.contains("/.codex/worktrees/")
 }
 
-fn language_under(dir: &Path, stop: Option<&Path>, skip_under: &[PathBuf]) -> Vec<Node> {
+fn language_under(
+    dir: &Path,
+    stop: Option<&Path>,
+    skip_under: &[PathBuf],
+    progress: &mut dyn ScanProgress,
+    add_to_total: bool,
+) -> Vec<Node> {
     let stop = stop.unwrap_or(dir);
     let mut out = Vec::new();
-    walk_language(dir, stop, skip_under, 0, &mut out);
+    walk_language(dir, stop, skip_under, 0, &mut out, progress, add_to_total);
     out.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
     out
 }
 
-fn walk_language(dir: &Path, stop: &Path, skip_under: &[PathBuf], depth: u32, out: &mut Vec<Node>) {
+fn walk_language(
+    dir: &Path,
+    stop: &Path,
+    skip_under: &[PathBuf],
+    depth: u32,
+    out: &mut Vec<Node>,
+    progress: &mut dyn ScanProgress,
+    add_to_total: bool,
+) {
     if depth > 18 || !can_walk(dir) {
         return;
+    }
+    if depth == 0 {
+        progress.walking(dir, None);
     }
     if skip_under.iter().any(|s| dir == s || dir.starts_with(s)) && depth > 0 {
         return;
@@ -231,7 +283,7 @@ fn walk_language(dir: &Path, stop: &Path, skip_under: &[PathBuf], depth: u32, ou
     if depth > 0 {
         if let Some((lang, art, _)) = claim_language(dir, stop) {
             if can_emit_node(dir) {
-                out.push(language_node(dir, lang, art));
+                out.push(language_node(dir, lang, art, progress, add_to_total));
             }
             return;
         }
@@ -245,7 +297,15 @@ fn walk_language(dir: &Path, stop: &Path, skip_under: &[PathBuf], depth: u32, ou
     for ent in rd.flatten() {
         let p = ent.path();
         if p.is_dir() {
-            walk_language(&p, stop, skip_under, depth + 1, out);
+            walk_language(
+                &p,
+                stop,
+                skip_under,
+                depth + 1,
+                out,
+                progress,
+                add_to_total,
+            );
         }
     }
 }
@@ -254,20 +314,17 @@ fn language_node(
     path: &Path,
     lang: &dyn crate::plugins::LanguagePlugin,
     art: &crate::plugins::ArtifactSpec,
+    progress: &mut dyn ScanProgress,
+    add_to_total: bool,
 ) -> Node {
     let (what, if_deleted, how_rebuild) = lang.explain(art.id);
-    Node {
+    let node = Node {
         id: path_id(path),
         path: path.to_path_buf(),
         kind: Kind::LanguageArtifact,
         plugin_id: lang.id().to_string(),
         parent_id: None,
-        size_bytes: {
-            eprint!("  size {} ... ", path.display());
-            let s = crate::inventory::du(path);
-            eprintln!("{}", crate::inventory::human(s));
-            s
-        },
+        size_bytes: measure(path, &label("lang", lang.id()), add_to_total, progress),
         mtime: std::fs::metadata(path).and_then(|m| m.modified()).ok(),
         default_action: DefaultAction::SuggestTrash,
         clean_method: CleanMethod::Trash,
@@ -281,10 +338,17 @@ fn language_node(
         },
         child_summary: String::new(),
         children: Vec::new(),
-    }
+    };
+    progress.found(
+        path,
+        &label("lang", lang.id()),
+        node.size_bytes,
+        add_to_total,
+    );
+    node
 }
 
-fn cache_nodes() -> Vec<Node> {
+fn cache_nodes(progress: &mut dyn ScanProgress) -> Vec<Node> {
     let mut out = Vec::new();
     let home = crate::safety::home();
     for spec in caches() {
@@ -318,18 +382,16 @@ fn cache_nodes() -> Vec<Node> {
                 CacheClean::OfficialCmd => CleanMethod::OfficialCmd,
                 CacheClean::None => CleanMethod::None,
             };
+            progress.walking(&path, None);
+            let size = measure(&path, &label("cache", spec.id), true, progress);
+            progress.found(&path, &label("cache", spec.id), size, true);
             out.push(Node {
                 id: path_id(&path),
                 path: path.clone(),
                 kind: Kind::Cache,
                 plugin_id: spec.id.to_string(),
                 parent_id: None,
-                size_bytes: {
-                    eprint!("  size {} ... ", path.display());
-                    let s = crate::inventory::du(&path);
-                    eprintln!("{}", crate::inventory::human(s));
-                    s
-                },
+                size_bytes: size,
                 mtime: std::fs::metadata(&path).and_then(|m| m.modified()).ok(),
                 default_action: DefaultAction::InspectOnly,
                 clean_method: method,

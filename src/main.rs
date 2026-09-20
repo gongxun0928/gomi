@@ -1,3 +1,5 @@
+use std::io::IsTerminal;
+
 use clap::Parser;
 
 use gomi::cli::{Cli, Command};
@@ -9,11 +11,20 @@ use gomi::report;
 fn main() {
     let cli = Cli::parse();
     match cli.cmd {
-        Command::Scan { root, no_hotspots } => {
+        Command::Scan {
+            root,
+            no_hotspots,
+            plain,
+        } => {
             let cfg = Config::load(&root, !no_hotspots);
-            eprintln!("scan roots: {:?}", cfg.project_roots);
             let inv = scan(&cfg);
-            report::print_scan(&inv.roots);
+            let tty = std::io::stdout().is_terminal();
+            if plain || !tty {
+                report::print_scan(&inv.roots);
+            } else if let Err(err) = gomi::tui::run(inv.roots) {
+                eprintln!("tui failed: {err}");
+                std::process::exit(1);
+            }
         }
         Command::Inspect { path, root, no_hotspots } => {
             let cfg = Config::load(&root, !no_hotspots);

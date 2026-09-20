@@ -21,6 +21,9 @@ pub enum Command {
         /// Skip agent worktrees and toolchain caches.
         #[arg(long)]
         no_hotspots: bool,
+        /// Print a flat list instead of the tree TUI.
+        #[arg(long)]
+        plain: bool,
     },
     /// Expand one path (including children).
     Inspect {

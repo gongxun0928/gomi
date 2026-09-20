@@ -1,4 +1,5 @@
-use crate::inventory::{human, Kind, Node};
+use crate::group::{build_tree, format_cluster, paint_line};
+use crate::inventory::{human, Node};
 
 pub fn print_scan(roots: &[Node]) {
     println!("gomi scan (read-only)\n");
@@ -6,48 +7,26 @@ pub fn print_scan(roots: &[Node]) {
         println!("no entries. use --root to set a project root.");
         return;
     }
-    let mut total = 0u64;
-    for n in roots {
-        total = total.saturating_add(n.size_bytes);
-        print_root(n);
+    let tree = build_tree(roots.to_vec());
+    for kind in &tree {
+        println!(
+            "{}",
+            paint_line(
+                &format_cluster(&kind.title, kind.bytes, kind.count, 0),
+                kind.bytes
+            )
+        );
+        for plugin in &kind.children {
+            println!(
+                "{}",
+                paint_line(
+                    &format_cluster(&plugin.title, plugin.bytes, plugin.count, 2),
+                    plugin.bytes
+                )
+            );
+        }
     }
-    println!(
-        "\nroot total {} (child sizes are included in parents; not added twice)",
-        human(total)
-    );
-    println!("inspect: gomi inspect <path>");
-    println!("explain: gomi explain <id>");
-    println!("dry-run: gomi clean [id...]");
-}
-
-fn print_root(n: &Node) {
-    let kind = kind_label(n.kind);
-    let extra = if n.child_summary.is_empty() {
-        String::new()
-    } else {
-        format!("  {}", n.child_summary)
-    };
-    let dirty = match n.git_dirty {
-        Some(true) => "  dirty",
-        Some(false) => "  clean",
-        None => "",
-    };
-    let stale = match n.stale {
-        Some(true) => "  stale",
-        Some(false) => "  recent",
-        None => "",
-    };
-    println!(
-        "#{}  {:>10}  {:<16}  {}{}{}{}  [{}]",
-        n.id,
-        human(n.size_bytes),
-        format!("{}/{}", kind, n.plugin_id),
-        n.path.display(),
-        extra,
-        dirty,
-        stale,
-        n.default_action.as_str()
-    );
+    println!("\nuse TUI (default scan) to expand paths.");
 }
 
 pub fn print_inspect(n: &Node) {
@@ -85,14 +64,10 @@ pub fn print_explain(n: &Node) {
     println!("{}", n.explain.what);
     println!("if deleted: {}", n.explain.if_deleted);
     println!("rebuild: {}", n.explain.how_rebuild);
-    println!("action: {} / {}", n.default_action.as_str(), n.clean_method.as_str());
+    println!(
+        "action: {} / {}",
+        n.default_action.as_str(),
+        n.clean_method.as_str()
+    );
 }
 
-fn kind_label(k: Kind) -> &'static str {
-    match k {
-        Kind::LanguageArtifact => "lang",
-        Kind::AgentWorkspace => "agent",
-        Kind::Cache => "cache",
-        Kind::Unknown => "unknown",
-    }
-}
