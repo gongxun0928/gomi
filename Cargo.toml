@@ -1,0 +1,16 @@
+[package]
+name = "gomi"
+version = "0.1.0"
+edition = "2021"
+description = "Explain and dry-run developer disk usage on macOS. Never deletes unless you later authorize apply."
+license = "MIT"
+publish = false
+
+[dependencies]
+blake3 = "1"
+camino = "1"
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+toml = "0.8"
