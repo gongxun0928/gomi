@@ -2,7 +2,7 @@
 name = "gomi"
 version = "0.1.0"
 edition = "2021"
-description = "Explain and dry-run developer disk usage on macOS. Never deletes unless you later authorize apply."
+description = "Explain developer disk usage on macOS. CLI clean is dry-run; TUI can Trash marked suggest_trash items after confirm."
 license = "MIT"
 publish = false
 
@@ -16,3 +16,4 @@ ratatui = "0.29"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 toml = "0.8"
+trash = "5"

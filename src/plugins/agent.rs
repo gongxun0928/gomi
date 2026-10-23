@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::AgentPlugin;
 use crate::safety::home;
@@ -79,7 +79,16 @@ pub fn all() -> Vec<&'static dyn AgentPlugin> {
     vec![&CURSOR, &CODEX, &CLAUDE, &OPENCODE, &GENERIC]
 }
 
-pub fn claim_by_path(path: &std::path::Path) -> &'static dyn AgentPlugin {
+pub fn under_agent_root(path: &Path) -> bool {
+    all().iter().any(|plugin| {
+        plugin
+            .roots()
+            .iter()
+            .any(|root| path == root || path.starts_with(root))
+    })
+}
+
+pub fn claim_by_path(path: &Path) -> &'static dyn AgentPlugin {
     let p = path.to_string_lossy();
     if p.contains("/.cursor/worktrees/") {
         return &CURSOR;

@@ -5,7 +5,8 @@ use clap::Parser;
 use gomi::cli::{Cli, Command};
 use gomi::config::Config;
 use gomi::engine::{dry_run, scan};
-use gomi::inventory::{Kind, Node};
+use gomi::filter::ScanFilter;
+use gomi::inventory::Node;
 use gomi::report;
 
 fn main() {
@@ -15,13 +16,23 @@ fn main() {
             root,
             no_hotspots,
             plain,
+            agent,
+            lang,
+            cache,
         } => {
-            let cfg = Config::load(&root, !no_hotspots);
+            let filter = match ScanFilter::from_flags(&agent, &lang, &cache) {
+                Ok(f) => f,
+                Err(err) => {
+                    eprintln!("{err}");
+                    std::process::exit(2);
+                }
+            };
+            let cfg = Config::load(&root, !no_hotspots).with_filter(filter);
             let inv = scan(&cfg);
             let tty = std::io::stdout().is_terminal();
             if plain || !tty {
                 report::print_scan(&inv.roots);
-            } else if let Err(err) = gomi::tui::run(inv.roots) {
+            } else if let Err(err) = gomi::tui::run(inv.roots, cfg.stale_after_days) {
                 eprintln!("tui failed: {err}");
                 std::process::exit(1);
             }
@@ -36,20 +47,6 @@ fn main() {
                     eprintln!("no matching node: {}", canon.display());
                     std::process::exit(1);
                 }
-            }
-        }
-        Command::Worktrees { root } => {
-            let cfg = Config::load(&root, true);
-            let inv = scan(&cfg);
-            let trees: Vec<&Node> = inv
-                .roots
-                .iter()
-                .filter(|n| n.kind == Kind::AgentWorkspace)
-                .collect();
-            if trees.is_empty() {
-                println!("no agent / git worktrees found");
-            } else {
-                report::print_scan(&trees.into_iter().cloned().collect::<Vec<_>>());
             }
         }
         Command::Clean { ids, root, no_hotspots } => {

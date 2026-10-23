@@ -47,27 +47,35 @@ fn print_detail(n: &Node, indent: usize) {
     println!("{pad}  {}", n.explain.what);
     println!("{pad}  if deleted: {}", n.explain.if_deleted);
     println!("{pad}  rebuild: {}", n.explain.how_rebuild);
+    if !n.child_summary.is_empty() {
+        println!("{pad}  safety: {}", n.child_summary);
+    }
     if let Some(d) = n.git_dirty {
         println!("{pad}  git dirty: {d}");
     }
     if let Some(s) = n.stale {
-        println!("{pad}  stale(>14d): {s}");
+        println!("{pad}  stale(>7d): {s}");
     }
     for c in &n.children {
         print_detail(c, indent + 1);
     }
 }
 
-pub fn print_explain(n: &Node) {
-    println!("gomi explain (rules only, no AI)\n");
-    println!("#{}  {}", n.id, n.path.display());
-    println!("{}", n.explain.what);
-    println!("if deleted: {}", n.explain.if_deleted);
-    println!("rebuild: {}", n.explain.how_rebuild);
-    println!(
-        "action: {} / {}",
+pub fn explain_text(n: &Node) -> String {
+    format!(
+        "rules only, no AI\n#{}  {}  {}\n{}\nif deleted: {}\nrebuild: {}\naction: {} / {}",
+        n.id,
+        human(n.size_bytes),
+        n.path.display(),
+        n.explain.what,
+        n.explain.if_deleted,
+        n.explain.how_rebuild,
         n.default_action.as_str(),
         n.clean_method.as_str()
-    );
+    )
+}
+
+pub fn print_explain(n: &Node) {
+    println!("gomi explain\n{}", explain_text(n));
 }
 
