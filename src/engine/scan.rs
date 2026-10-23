@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
 
 use crate::config::Config;
 use crate::gitx;
@@ -57,35 +56,44 @@ pub fn scan(cfg: &Config) -> Inventory {
 
 pub fn scan_with(cfg: &Config, progress: &mut dyn ScanProgress) -> Inventory {
     let mut covered: HashSet<PathBuf> = HashSet::new();
+    let mut skip_lang_under: Vec<PathBuf> = Vec::new();
     let mut roots = Vec::new();
 
-    if cfg.include_hotspots {
+    if walk_agents(cfg) {
         for checkout in discover_agent_checkouts(cfg) {
             if !covered.insert(checkout.clone()) {
                 continue;
             }
             if let Some(node) = agent_node(&checkout, cfg, progress) {
-                roots.push(node);
+                skip_lang_under.push(node.path.clone());
+                roots.extend(take_filtered(cfg, node));
             }
         }
     }
-
-    let agent_paths: Vec<PathBuf> = roots.iter().map(|n| n.path.clone()).collect();
 
     for proj in &cfg.project_roots {
         if is_forbidden_scan_root(proj) {
             continue;
         }
         progress.walking(proj, None);
-        if cfg.include_hotspots {
-            collect_git_worktrees(proj, &mut covered, &mut roots, cfg, progress);
+        if walk_agents(cfg) {
+            collect_git_worktrees(
+                proj,
+                &mut covered,
+                &mut skip_lang_under,
+                &mut roots,
+                cfg,
+                progress,
+            );
         }
-        let arts = language_under(proj, Some(proj), &agent_paths, progress, true);
-        roots.extend(arts);
+        if cfg.filter.wants_kind(Kind::LanguageArtifact) {
+            let arts = language_under(proj, Some(proj), &skip_lang_under, cfg, progress, true);
+            roots.extend(arts);
+        }
     }
 
-    if cfg.include_hotspots {
-        roots.extend(cache_nodes(progress));
+    if cfg.include_hotspots && cfg.filter.wants_kind(Kind::Cache) {
+        roots.extend(cache_nodes(cfg, progress));
     }
     roots.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
     Inventory { roots }
@@ -107,9 +115,49 @@ fn label(kind: &str, plugin: &str) -> String {
     format!("{kind}/{plugin}")
 }
 
+fn walk_agents(cfg: &Config) -> bool {
+    cfg.include_hotspots
+        && (cfg.filter.wants_kind(Kind::AgentWorkspace)
+            || cfg.filter.wants_kind(Kind::LanguageArtifact))
+}
+
+fn discover_agent_plugin(cfg: &Config, plugin_id: &str) -> bool {
+    if cfg.filter.is_open() || cfg.filter.wants_kind(Kind::LanguageArtifact) {
+        return true;
+    }
+    cfg.filter.allows(Kind::AgentWorkspace, plugin_id)
+}
+
+fn take_filtered(cfg: &Config, mut node: Node) -> Vec<Node> {
+    if node.kind != Kind::AgentWorkspace {
+        if cfg.filter.allows(node.kind, &node.plugin_id) {
+            return vec![node];
+        }
+        return Vec::new();
+    }
+    let emit_agent = cfg.filter.allows(Kind::AgentWorkspace, &node.plugin_id);
+    if emit_agent {
+        if !cfg.filter.wants_kind(Kind::LanguageArtifact) {
+            node.children.clear();
+        } else {
+            node.children
+                .retain(|c| cfg.filter.allows(c.kind, &c.plugin_id));
+        }
+        vec![node]
+    } else {
+        node.children
+            .into_iter()
+            .filter(|c| cfg.filter.allows(c.kind, &c.plugin_id))
+            .collect()
+    }
+}
+
 fn discover_agent_checkouts(cfg: &Config) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for plugin in agent::all() {
+        if !discover_agent_plugin(cfg, plugin.id()) {
+            continue;
+        }
         for root in plugin.roots() {
             if root.is_dir() {
                 out.extend(discover_checkouts(&root));
@@ -132,6 +180,7 @@ fn discover_agent_checkouts(cfg: &Config) -> Vec<PathBuf> {
 fn collect_git_worktrees(
     proj: &Path,
     covered: &mut HashSet<PathBuf>,
+    skip_lang_under: &mut Vec<PathBuf>,
     roots: &mut Vec<Node>,
     cfg: &Config,
     progress: &mut dyn ScanProgress,
@@ -145,7 +194,8 @@ fn collect_git_worktrees(
                 continue;
             }
             if let Some(node) = agent_node(&wt.path, cfg, progress) {
-                roots.push(node);
+                skip_lang_under.push(node.path.clone());
+                roots.extend(take_filtered(cfg, node));
             }
         }
     });
@@ -179,30 +229,34 @@ fn agent_node(checkout: &Path, cfg: &Config, progress: &mut dyn ScanProgress) ->
         return None;
     }
     let plugin = claim_by_path(checkout);
-    let primary = gitx::is_primary_checkout(checkout) && !under_agent_root(checkout);
-    let dirty = gitx::is_dirty(checkout);
-    let mtime = gitx::dir_mtime(checkout);
-    let stale = is_stale(mtime, cfg.stale_after_days);
+    let facts = gitx::inspect_checkout(
+        checkout,
+        cfg.stale_after_days,
+        crate::plugins::agent::under_agent_root(checkout),
+    );
+    let verdict = gitx::classify(&facts);
+    let (action, method) = verdict.action();
     progress.walking(checkout, None);
-    let children = language_under(checkout, Some(checkout), &[], progress, false);
+    let children = if cfg.filter.wants_kind(Kind::LanguageArtifact) {
+        language_under(checkout, Some(checkout), &[], cfg, progress, false)
+    } else {
+        Vec::new()
+    };
     let size = measure(checkout, &label("agent", plugin.id()), true, progress);
-    let (action, method) = if primary {
-        (DefaultAction::None, CleanMethod::None)
-    } else if dirty {
-        (DefaultAction::WarnOnly, CleanMethod::GitWorktreeRemove)
-    } else if !stale {
-        (DefaultAction::WarnOnly, CleanMethod::GitWorktreeRemove)
-    } else if gitx::is_linked_worktree(checkout) {
-        (DefaultAction::SuggestTrash, CleanMethod::GitWorktreeRemove)
-    } else {
-        (DefaultAction::SuggestTrash, CleanMethod::Trash)
-    };
     let n_art = children.len();
-    let child_summary = if n_art == 0 {
-        String::new()
+    let role = if facts.is_primary {
+        "primary".to_string()
+    } else if let Some(branch) = &facts.branch {
+        format!("branch {branch}")
+    } else if facts.detached {
+        "detached HEAD".into()
     } else {
-        format!("{n_art} rebuildable artifact(s)")
+        "copy / worktree".into()
     };
+    let mut child_summary = verdict.label().to_string();
+    if n_art > 0 {
+        child_summary.push_str(&format!("; {n_art} rebuildable artifact(s)"));
+    }
     let id = path_id(checkout);
     let mut node = Node {
         id: id.clone(),
@@ -211,20 +265,29 @@ fn agent_node(checkout: &Path, cfg: &Config, progress: &mut dyn ScanProgress) ->
         plugin_id: plugin.id().to_string(),
         parent_id: None,
         size_bytes: size,
-        mtime,
+        mtime: facts.mtime,
         default_action: action,
         clean_method: method,
         rebuildable: false,
-        git_dirty: Some(dirty),
-        stale: Some(stale),
+        git_dirty: facts.dirty,
+        stale: Some(facts.stale),
         explain: Explain {
             what: format!(
-                "{} workspace ({}); primary checkout is not deletable.",
+                "{} workspace ({}); {}.",
                 plugin.display_name(),
-                if primary { "primary" } else { "copy / worktree" }
+                role,
+                verdict.reason()
             ),
-            if_deleted: "Would Trash or git worktree remove the whole tree; may contain local files. This build is dry-run only."
-                .into(),
+            if_deleted: match verdict {
+                gitx::WorktreeVerdict::SuggestRemove => {
+                    "Would run git worktree remove. This build is dry-run only.".into()
+                }
+                gitx::WorktreeVerdict::SuggestTrashCopy => {
+                    "Would move the copy to Trash. This build is dry-run only.".into()
+                }
+                _ => "Would not remove this checkout; git safety did not pass. This build is dry-run only."
+                    .into(),
+            },
             how_rebuild: "Recreate the worktree from the main repo / rerun the agent.".into(),
         },
         child_summary,
@@ -242,21 +305,26 @@ fn agent_node(checkout: &Path, cfg: &Config, progress: &mut dyn ScanProgress) ->
     Some(node)
 }
 
-fn under_agent_root(path: &Path) -> bool {
-    let s = path.to_string_lossy();
-    s.contains("/.cursor/worktrees/") || s.contains("/.codex/worktrees/")
-}
-
 fn language_under(
     dir: &Path,
     stop: Option<&Path>,
     skip_under: &[PathBuf],
+    cfg: &Config,
     progress: &mut dyn ScanProgress,
     add_to_total: bool,
 ) -> Vec<Node> {
     let stop = stop.unwrap_or(dir);
     let mut out = Vec::new();
-    walk_language(dir, stop, skip_under, 0, &mut out, progress, add_to_total);
+    walk_language(
+        dir,
+        stop,
+        skip_under,
+        0,
+        &mut out,
+        cfg,
+        progress,
+        add_to_total,
+    );
     out.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
     out
 }
@@ -267,6 +335,7 @@ fn walk_language(
     skip_under: &[PathBuf],
     depth: u32,
     out: &mut Vec<Node>,
+    cfg: &Config,
     progress: &mut dyn ScanProgress,
     add_to_total: bool,
 ) {
@@ -282,7 +351,9 @@ fn walk_language(
     let name = dir.file_name().and_then(|s| s.to_str()).unwrap_or("");
     if depth > 0 {
         if let Some((lang, art, _)) = claim_language(dir, stop) {
-            if can_emit_node(dir) {
+            if can_emit_node(dir)
+                && cfg.filter.allows(Kind::LanguageArtifact, lang.id())
+            {
                 out.push(language_node(dir, lang, art, progress, add_to_total));
             }
             return;
@@ -303,6 +374,7 @@ fn walk_language(
                 skip_under,
                 depth + 1,
                 out,
+                cfg,
                 progress,
                 add_to_total,
             );
@@ -348,10 +420,13 @@ fn language_node(
     node
 }
 
-fn cache_nodes(progress: &mut dyn ScanProgress) -> Vec<Node> {
+fn cache_nodes(cfg: &Config, progress: &mut dyn ScanProgress) -> Vec<Node> {
     let mut out = Vec::new();
     let home = crate::safety::home();
     for spec in caches() {
+        if !cfg.filter.allows(Kind::Cache, spec.id) {
+            continue;
+        }
         let mut paths = Vec::new();
         for pat in spec.exact_paths {
             let p = expand_exact(pat);
@@ -417,13 +492,3 @@ fn cache_nodes(progress: &mut dyn ScanProgress) -> Vec<Node> {
     out
 }
 
-fn is_stale(mtime: Option<SystemTime>, days: u64) -> bool {
-    let Some(t) = mtime else {
-        return false;
-    };
-    SystemTime::now()
-        .duration_since(t)
-        .ok()
-        .map(|d| d >= Duration::from_secs(days.saturating_mul(86400)))
-        .unwrap_or(false)
-}

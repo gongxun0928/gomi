@@ -236,14 +236,18 @@ impl ScanProgress for StderrProgress {
         if add_to_total {
             self.total = self.total.saturating_add(bytes);
         }
-        self.redraw();
+        if self.tty {
+            self.redraw();
+        }
     }
 
     fn finish(&mut self) {
         self.inflight = None;
         self.last_path = None;
         self.last_measuring = None;
-        self.redraw();
+        if self.tty {
+            self.redraw();
+        }
     }
 }
 

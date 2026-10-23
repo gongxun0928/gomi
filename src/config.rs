@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use crate::filter::ScanFilter;
 use crate::safety::home;
 
 #[derive(Debug, Clone)]
@@ -8,6 +9,7 @@ pub struct Config {
     pub extra_watch: Vec<PathBuf>,
     pub stale_after_days: u64,
     pub include_hotspots: bool,
+    pub filter: ScanFilter,
 }
 
 impl Config {
@@ -30,9 +32,15 @@ impl Config {
         Self {
             project_roots: roots,
             extra_watch: Vec::new(),
-            stale_after_days: 14,
+            stale_after_days: 7,
             include_hotspots,
+            filter: ScanFilter::open(),
         }
+    }
+
+    pub fn with_filter(mut self, filter: ScanFilter) -> Self {
+        self.filter = filter;
+        self
     }
 }
 
